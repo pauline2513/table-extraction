@@ -1,5 +1,4 @@
 import io
-import logging
 import os
 
 from typing import List, Optional, Tuple
@@ -16,14 +15,6 @@ from preprocessing import preprocess_crop_for_paddle, preprocess_page_for_detect
 
 TABLE_MODEL_ID = "microsoft/table-transformer-detection"
 TABLE_SCORE_THRESHOLD = 0.7
-
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-logger = logging.getLogger("app_paddle")
-
 
 # убираем NaN и лишние пробелы
 def sanitize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -59,11 +50,11 @@ def load_table_transformer():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model.to(device)
         model.eval()
-        logger.info("Loaded table detector model on %s", device)
+        print("loaded table detector")
         return {"processor": processor, "model": model, "device": device, "error": None}
     except Exception as exc:
-        logger.exception("Failed to load table detector")
-        return {"processor": None, "model": None, "device": None, "error": str(exc)}
+        raise exc
+        # return {"processor": None, "model": None, "device": None, "error": str(exc)}
 
 
 
@@ -81,11 +72,10 @@ def load_paddle_table_engine():
             use_chart_recognition=False,
             use_seal_recognition=False,
         )
-        logger.info("Loaded Paddle PPStructureV3 table engine")
+        print("Loaded Paddle PPStructureV3 table engine")
         return predictor
     except Exception as exc_v3:
-        logger.warning("PPStructureV3 unavailable: %s", exc_v3)
-        return None
+        raise
 
 # --------------------------------- НЕПОСРЕДСТВЕННО ДЕТЕКЦИЯ ТАБЛИЦ ---------------------------------
 def detect_table_regions_transformer(image_bgr: np.ndarray) -> Tuple[List[DetectedBox], Optional[str]]:
@@ -136,7 +126,7 @@ def detect_table_regions_transformer(image_bgr: np.ndarray) -> Tuple[List[Detect
             )
         )
     boxes.sort(key=lambda b: (b.y, b.x))
-    logger.info("Transformer detector found %s region(s)", len(boxes))
+    print("Transformer detector found %s region(s)", len(boxes))
     return boxes, None
 
 # вытаскиваем таблизу из результата paddle через html
@@ -201,7 +191,7 @@ def extract_tables_with_paddle(crop_bgr: np.ndarray) -> List[pd.DataFrame]:
     frames: List[pd.DataFrame] = []
     for html in html_list:
         frames.extend(html_to_dataframes(html))
-    logger.info("Paddle OCR extracted %s table frame(s) from crop", len(frames))
+    print(f"Paddle OCR extracted {len(frames)} table frame(s) from crop")
     return frames
 
 # для отрисовки ббоксов на документах
@@ -250,14 +240,13 @@ def process_images_with_detector(images_bgr: List[np.ndarray], source_name: str)
     debug_images: List[np.ndarray] = []
 
     for page_idx, raw_page in enumerate(images_bgr, start=1):
-        logger.info("Processing %s page %s", source_name, page_idx)
         page = preprocess_page_for_detection(raw_page)
         boxes, detector_error = detect_table_regions_transformer(page)
         if detector_error:
-            logger.warning("Transformer detector error on page %s: %s", page_idx, detector_error)
+            print(f"Transformer detector error on page {page_idx}: {detector_error}")
         if not boxes:
             boxes = [DetectedBox(0, 0, page.shape[1], page.shape[0], 0.0, "full_page")]
-            logger.info("No table boxes found, fallback to full-page OCR on page %s", page_idx)
+            print(f"No table boxes found, fallback to full-page OCR on page {page_idx}")
 
         debug_images.append(draw_boxes(page, boxes))
         # print(boxes)
@@ -268,7 +257,6 @@ def process_images_with_detector(images_bgr: List[np.ndarray], source_name: str)
             prepared_crop = preprocess_crop_for_paddle(crop) # обрежем файл по найденному ббоксу
             tables = extract_tables_with_paddle(prepared_crop) # уже из обрезанного варианта извлечем таблицы
             if not tables:
-                logger.info("No tables in crop %s on page %s", box_idx, page_idx)
                 continue
             for table_idx, df in enumerate(tables, start=1):
                 all_tables.append(
@@ -284,7 +272,6 @@ def process_images_with_detector(images_bgr: List[np.ndarray], source_name: str)
     return ExtractionResult(method=method, tables=all_tables, debug_images=debug_images)
 # --------------------------------- ИЗВЛЕЧЕНИЕ TEXT LIKE ТАБЛИЦ ---------------------------------
 def process_images_with_ocr(image_bgr: np.ndarray, source_name: str):
-    logger.info("Processing %s page %s", source_name)
     from paddleocr import PaddleOCR
     ocr = PaddleOCR(
         lang="ru",
@@ -468,7 +455,6 @@ def build_table_from_ocr_json(ocr_result, y_threshold=None, x_tolerance=None) ->
 def extract_tables_born_digital(pdf_bytes: bytes) -> List[ExtractedTable]:
     found: List[ExtractedTable] = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        logger.info("pdfplumber opened PDF with %s page(s)", len(pdf.pages))
         for page_idx, page in enumerate(pdf.pages, start=1):
             for table_idx, rows in enumerate(page.extract_tables() or [], start=1):
                 df = rows_to_dataframe(rows)
@@ -480,7 +466,7 @@ def extract_tables_born_digital(pdf_bytes: bytes) -> List[ExtractedTable]:
                         dataframe=df,
                     )
                 )
-    logger.info("pdfplumber extracted %s table(s)", len(found))
+    print(f"pdfplumber extracted {len(found)} table(s)")
     return found
 
 
@@ -493,7 +479,7 @@ def process_born_digital_pdf(pdf_bytes: bytes) -> ExtractionResult:
             debug_images=[],
         )
 
-    logger.info("pdfplumber found no tables, fallback to detector branch")
+    print("pdfplumber found no tables, fallback to detector branch")
     pages = pdf_bytes_to_images(pdf_bytes, scale=3.5)
     return process_images_with_detector(pages, source_name="born_digital_fallback")
 
@@ -539,7 +525,6 @@ def show_file_preview(uploaded_file, file_type: str):
                     width='stretch',
                 )
         except Exception as exc:
-            logger.exception("Failed to render PDF preview: %s", exc)
             st.info("Не удалось отобразить превью, но файл можно обработать.")
         return
     st.image(raw, caption="Превью скана", width='stretch')
@@ -566,7 +551,6 @@ def render_result(result: ExtractionResult, prefix: str):
             key=f"download_{prefix}",
         )
     except Exception as exc:
-        logger.exception(f"Failed to build xlsx: {exc}")
         st.error("Не удалось собрать Excel-файл.")
 
     if result.debug_images:
@@ -611,7 +595,6 @@ def main():
         )
         if run and uploaded is not None: # запуск распознавания если файл загружен и нажата кнопка извлечения таблиц
             try:
-                logger.info(f"Started main processing for file {uploaded.name}, type={file_type}")
                 with st.spinner("Идет обработка..."):
                     raw = uploaded.getvalue()
                     if file_type == "born_digital":
@@ -622,9 +605,7 @@ def main():
                         result = build_table_from_ocr_json(process_textlike_tables(raw))
                     st.session_state["main_result"] = result
                     st.session_state["main_error"] = ""
-                # logger.info("Main processing finished. Tables found: %s", len(result.tables))
             except Exception as exc:
-                logger.exception("Main processing failed: %s", exc)
                 st.session_state["main_result"] = None
                 st.session_state["main_error"] = str(exc)
     # отображение результата на правой части экрана
@@ -650,14 +631,11 @@ def main():
         rerun = st.button("Обработать скриншот", disabled=screenshot is None, key="shot_button")
         if rerun and screenshot is not None: # если не распозналось или распозналось плохо, можно попробовать загрузить просто скриншот таблицы с обработкой через детектор + OCR, иногда работает лучше
             try:
-                logger.info("Started screenshot processing: %s", screenshot.name)
                 with st.spinner("Обрабатка..."):
                     shot_result = process_screenshot(screenshot.getvalue())
                     st.session_state["shot_result"] = shot_result
                     st.session_state["shot_error"] = ""
-                logger.info("Screenshot processing finished. Tables found: %s", len(shot_result.tables))
             except Exception as exc:
-                logger.exception(f"Screenshot processing failed: {exc}")
                 st.session_state["shot_result"] = None
                 st.session_state["shot_error"] = str(exc)
 
