@@ -39,22 +39,22 @@ def rows_to_dataframe(rows: List[List[str]]) -> Optional[pd.DataFrame]:
     return sanitize_dataframe(pd.DataFrame(padded))
 
 # --------------------------------- ЗАГРУЗКА ДЕТЕКТОРА ТАБЛИЦ ---------------------------------
-@st.cache_resource(show_spinner=False)
-def load_table_transformer():
-    import torch
-    from transformers import AutoImageProcessor, TableTransformerForObjectDetection
-    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    try:
-        processor = AutoImageProcessor.from_pretrained(TABLE_MODEL_ID)
-        model = TableTransformerForObjectDetection.from_pretrained(TABLE_MODEL_ID)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model.to(device)
-        model.eval()
-        print("loaded table detector")
-        return {"processor": processor, "model": model, "device": device, "error": None}
-    except Exception as exc:
-        raise exc
-        # return {"processor": None, "model": None, "device": None, "error": str(exc)}
+# @st.cache_resource(show_spinner=False)
+# def load_table_transformer():
+#     import torch
+#     from transformers import AutoImageProcessor, TableTransformerForObjectDetection
+#     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+#     try:
+#         processor = AutoImageProcessor.from_pretrained(TABLE_MODEL_ID)
+#         model = TableTransformerForObjectDetection.from_pretrained(TABLE_MODEL_ID)
+#         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#         model.to(device)
+#         model.eval()
+#         print("loaded table detector")
+#         return {"processor": processor, "model": model, "device": device, "error": None}
+#     except Exception as exc:
+#         raise exc
+#         # return {"processor": None, "model": None, "device": None, "error": str(exc)}
 
 
 
@@ -78,56 +78,6 @@ def load_paddle_table_engine():
         raise
 
 # --------------------------------- НЕПОСРЕДСТВЕННО ДЕТЕКЦИЯ ТАБЛИЦ ---------------------------------
-def detect_table_regions_transformer(image_bgr: np.ndarray) -> Tuple[List[DetectedBox], Optional[str]]:
-    import torch
-    bundle = load_table_transformer()
-    if bundle is None:
-        return [], "Something went wrong with Paddle OCR"
-
-    processor = bundle["processor"]
-    model = bundle["model"]
-    device = bundle["device"]
-
-    pil_image = bgr_to_pil(image_bgr)
-    inputs = processor(images=pil_image, return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    with torch.no_grad():
-        outputs = model(**inputs)
-
-    target_sizes = torch.tensor([pil_image.size[::-1]], device=device)
-    detections = processor.post_process_object_detection(
-        outputs=outputs,
-        threshold=TABLE_SCORE_THRESHOLD,
-        target_sizes=target_sizes,
-    )[0]
-    id2label = model.config.id2label
-    height, width = image_bgr.shape[:2]
-
-    boxes: List[DetectedBox] = []
-    for score, label_id, box in zip(
-        detections["scores"], detections["labels"], detections["boxes"]
-    ):
-        label_name = str(id2label.get(int(label_id), int(label_id))).lower()
-        if "table" not in label_name:
-            continue
-        x1, y1, x2, y2 = [int(round(v)) for v in box.tolist()]
-        x1 = max(0, min(x1, width - 1))
-        y1 = max(0, min(y1, height - 1))
-        x2 = max(0, min(x2, width))
-        y2 = max(0, min(y2, height))
-        boxes.append(
-            DetectedBox(
-                x=x1,
-                y=y1,
-                w=max(1, x2 - x1),
-                h=max(1, y2 - y1),
-                score=float(score.item()),
-                label=label_name,
-            )
-        )
-    boxes.sort(key=lambda b: (b.y, b.x))
-    print("Transformer detector found %s region(s)", len(boxes))
-    return boxes, None
 
 # вытаскиваем таблизу из результата paddle через html
 def collect_table_html_v3(prediction) -> List[str]:
@@ -241,12 +191,12 @@ def process_images_with_detector(images_bgr: List[np.ndarray], source_name: str)
 
     for page_idx, raw_page in enumerate(images_bgr, start=1):
         page = preprocess_page_for_detection(raw_page)
-        boxes, detector_error = detect_table_regions_transformer(page)
-        if detector_error:
-            print(f"Transformer detector error on page {page_idx}: {detector_error}")
-        if not boxes:
-            boxes = [DetectedBox(0, 0, page.shape[1], page.shape[0], 0.0, "full_page")]
-            print(f"No table boxes found, fallback to full-page OCR on page {page_idx}")
+        # boxes, detector_error = detect_table_regions_transformer(page)
+        # if detector_error:
+        #     print(f"Transformer detector error on page {page_idx}: {detector_error}")
+        # if not boxes:
+        boxes = [DetectedBox(0, 0, page.shape[1], page.shape[0], 0.0, "full_page")]
+        print(f"No table boxes found, fallback to full-page OCR on page {page_idx}")
 
         debug_images.append(draw_boxes(page, boxes))
         # print(boxes)
@@ -553,14 +503,14 @@ def render_result(result: ExtractionResult, prefix: str):
     except Exception as exc:
         st.error("Не удалось собрать Excel-файл.")
 
-    if result.debug_images:
-        with st.expander("Найденные области таблиц", expanded=False):
-            for page_idx, debug in enumerate(result.debug_images, start=1):
-                st.image(
-                    cv2.cvtColor(debug, cv2.COLOR_BGR2RGB),
-                    caption=f"Страница {page_idx}",
-                    width='stretch',
-                )
+    # if result.debug_images:
+    #     with st.expander("Найденные области таблиц", expanded=False):
+    #         for page_idx, debug in enumerate(result.debug_images, start=1):
+    #             st.image(
+    #                 cv2.cvtColor(debug, cv2.COLOR_BGR2RGB),
+    #                 caption=f"Страница {page_idx}",
+    #                 width='stretch',
+    #             )
 
 # просто логика работы и отрисовка страницы
 def main():
