@@ -1,5 +1,6 @@
 import io
 import os
+from dataclasses import dataclass
 
 from typing import List, Optional, Tuple
 
@@ -12,6 +13,23 @@ from PIL import Image
 
 from custom_dataclasses import ExtractedTable, ExtractionResult
 from preprocessing import preprocess_crop_for_paddle, preprocess_page_for_detection, bgr_to_pil, pil_to_bgr, pdf_bytes_to_images
+
+TABLE_MODEL_ID = "microsoft/table-transformer-detection"
+TABLE_SCORE_THRESHOLD = 0.7
+
+
+@dataclass
+class DetectedBox:
+    x: int
+    y: int
+    w: int
+    h: int
+    score: float
+    label: str
+
+
+def log_processing(message: str) -> None:
+    print(f"[processing] {message}")
 
 # убираем NaN и лишние пробелы
 def sanitize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -53,6 +71,46 @@ def load_paddle_table_engine():
         return predictor
     except Exception as exc_v3:
         raise
+
+
+@st.cache_resource(show_spinner=False)
+def load_paddle_text_ocr():
+    from paddleocr import PaddleOCR
+
+    return PaddleOCR(
+        lang="ru",
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+    )
+
+
+@st.cache_resource(show_spinner=False)
+def load_table_transformer():
+    try:
+        import torch
+        from transformers import AutoImageProcessor, TableTransformerForObjectDetection
+    except ImportError:
+        try:
+            import torch
+            from transformers.models.auto.image_processing_auto import AutoImageProcessor
+            from transformers.models.auto.modeling_auto import (
+                AutoModelForObjectDetection as TableTransformerForObjectDetection,
+            )
+        except ImportError as exc:
+            return {"processor": None, "model": None, "device": None, "torch": None, "error": str(exc)}
+
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    try:
+        processor = AutoImageProcessor.from_pretrained(TABLE_MODEL_ID)
+        model = TableTransformerForObjectDetection.from_pretrained(TABLE_MODEL_ID)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.to(device)
+        model.eval()
+        print(f"Loaded Table Transformer on {device}")
+        return {"processor": processor, "model": model, "device": device, "torch": torch, "error": None}
+    except Exception as exc:
+        return {"processor": None, "model": None, "device": None, "torch": None, "error": str(exc)}
 
 # --------------------------------- НЕПОСРЕДСТВЕННО ДЕТЕКЦИЯ ТАБЛИЦ ---------------------------------
 
@@ -125,12 +183,15 @@ def extract_tables_with_paddle(crop_bgr: np.ndarray) -> List[pd.DataFrame]:
 def process_images_with_detector(images_bgr: List[np.ndarray], source_name: str) -> ExtractionResult:
     all_tables: List[ExtractedTable] = []
     debug_images: List[np.ndarray] = []
+    log_processing(f"Method=PP Structure V3, source={source_name}, pages={len(images_bgr)}")
 
     for page_idx, raw_page in enumerate(images_bgr, start=1):
+        log_processing(f"PP Structure V3: processing page {page_idx}")
         page = preprocess_page_for_detection(raw_page)
         prepared_crop = preprocess_crop_for_paddle(page) # обрежем файл по найденному ббоксу
         tables = extract_tables_with_paddle(prepared_crop) # уже из обрезанного варианта извлечем таблицы
         if not tables:
+            log_processing(f"PP Structure V3: no tables found on page {page_idx}")
             continue
         for table_idx, df in enumerate(tables, start=1):
             all_tables.append(
@@ -141,25 +202,443 @@ def process_images_with_detector(images_bgr: List[np.ndarray], source_name: str)
                     dataframe=df,
                 )
             )
+        log_processing(f"PP Structure V3: found {len(tables)} table(s) on page {page_idx}")
     method = f"PP Structure V3"
     return ExtractionResult(method=method, tables=all_tables, debug_images=debug_images)
 # --------------------------------- ИЗВЛЕЧЕНИЕ TEXT LIKE ТАБЛИЦ (или таблиц с объединенными вертикально клетками) ---------------------------------
 def process_images_with_ocr(image_bgr: np.ndarray, source_name: str):
-    from paddleocr import PaddleOCR
-    ocr = PaddleOCR(
-        lang="ru",
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-        use_textline_orientation=False,
-    )
-
+    log_processing(f"PaddleOCR: running OCR for source={source_name}")
+    ocr = load_paddle_text_ocr()
     result = ocr.predict(image_bgr)
     json_results = []
     for res in result:
         res.print()
-        res.save_to_img("output")
         json_results.append(res.json) 
     return json_results
+
+
+def smooth_signal(values: np.ndarray, window: int) -> np.ndarray:
+    if window <= 1 or len(values) == 0:
+        return values
+    kernel = np.ones(window, dtype=np.float32) / float(window)
+    return np.convolve(values, kernel, mode="same")
+
+
+def preprocess_for_projection(image_bgr: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.fastNlMeansDenoising(gray, None, h=8, templateWindowSize=7, searchWindowSize=21)
+    bw = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31,
+        10,
+    )
+    return cv2.morphologyEx(
+        bw,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)),
+        iterations=1,
+    )
+
+
+def preprocess_page_for_detection_adaptive(
+    image_bgr: np.ndarray,
+    table_type: str = "auto",
+) -> np.ndarray:
+    if table_type == "auto":
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+        lines = cv2.HoughLinesP(
+            edges,
+            1,
+            np.pi / 180,
+            100,
+            minLineLength=100,
+            maxLineGap=10,
+        )
+        table_type = "bordered" if lines is not None and len(lines) > 20 else "borderless"
+
+    if table_type == "bordered":
+        return preprocess_page_for_detection(image_bgr)
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    binary = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        10,
+    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 1))
+    dilated = cv2.dilate(binary, kernel, iterations=1)
+    return cv2.cvtColor(dilated, cv2.COLOR_GRAY2BGR)
+
+
+def iou(box1: DetectedBox, box2: DetectedBox) -> float:
+    x1 = max(box1.x, box2.x)
+    y1 = max(box1.y, box2.y)
+    x2 = min(box1.x + box1.w, box2.x + box2.w)
+    y2 = min(box1.y + box1.h, box2.y + box2.h)
+
+    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = box1.w * box1.h
+    area2 = box2.w * box2.h
+    union = area1 + area2 - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def non_max_suppression(
+    boxes: List[DetectedBox],
+    iou_threshold: float = 0.5,
+) -> List[DetectedBox]:
+    if not boxes:
+        return []
+
+    pending = sorted(boxes, key=lambda item: item.score, reverse=True)
+    result: List[DetectedBox] = []
+    while pending:
+        best = pending.pop(0)
+        result.append(best)
+        pending = [box for box in pending if iou(best, box) < iou_threshold]
+    return result
+
+
+def detect_table_regions_transformer_improved(
+    image_bgr: np.ndarray,
+    score_threshold: float = 0.5,
+    use_multiscale: bool = True,
+) -> Tuple[List[DetectedBox], Optional[str]]:
+    bundle = load_table_transformer()
+    if not bundle or bundle.get("error") or bundle.get("processor") is None or bundle.get("model") is None:
+        log_processing(f"Table Transformer unavailable: {(bundle or {}).get('error') or 'unknown error'}")
+        return [], (bundle or {}).get("error") or "Table detector is unavailable"
+
+    processor = bundle["processor"]
+    model = bundle["model"]
+    device = bundle["device"]
+    torch = bundle["torch"]
+
+    height, width = image_bgr.shape[:2]
+    pil_image = bgr_to_pil(image_bgr)
+    all_boxes: List[DetectedBox] = []
+
+    scales = [1.0] if not use_multiscale else [0.5, 0.75, 1.0, 1.25, 1.5]
+    for scale in scales:
+        if scale != 1.0:
+            scaled_pil = pil_image.resize(
+                (int(width * scale), int(height * scale)),
+                Image.Resampling.LANCZOS,
+            )
+        else:
+            scaled_pil = pil_image
+
+        inputs = processor(images=scaled_pil, return_tensors="pt")
+        inputs = {key: value.to(device) for key, value in inputs.items()}
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+
+        target_sizes = torch.tensor([scaled_pil.size[::-1]], device=device)
+        detections = processor.post_process_object_detection(
+            outputs=outputs,
+            threshold=score_threshold,
+            target_sizes=target_sizes,
+        )[0]
+        id2label = model.config.id2label
+
+        for score, label_id, box in zip(
+            detections["scores"],
+            detections["labels"],
+            detections["boxes"],
+        ):
+            label_name = str(id2label.get(int(label_id), int(label_id))).lower()
+            if "table" not in label_name:
+                continue
+
+            x1, y1, x2, y2 = [int(round(v)) for v in box.tolist()]
+            if scale != 1.0:
+                x1 = int(x1 / scale)
+                y1 = int(y1 / scale)
+                x2 = int(x2 / scale)
+                y2 = int(y2 / scale)
+
+            x1 = max(0, min(x1, width - 1))
+            y1 = max(0, min(y1, height - 1))
+            x2 = max(0, min(x2, width))
+            y2 = max(0, min(y2, height))
+            all_boxes.append(
+                DetectedBox(
+                    x=x1,
+                    y=y1,
+                    w=max(1, x2 - x1),
+                    h=max(1, y2 - y1),
+                    score=float(score.item()),
+                    label=label_name,
+                )
+            )
+
+    if len(all_boxes) > 1:
+        all_boxes = non_max_suppression(all_boxes, iou_threshold=0.5)
+
+    all_boxes.sort(key=lambda box: (box.y, box.x))
+    log_processing(f"Table Transformer: detected {len(all_boxes)} region(s)")
+    return all_boxes, None
+
+
+def merge_textlike_boxes(boxes: List[Tuple[int, int, int, int]]) -> List[Tuple[int, int, int, int]]:
+    merged: List[Tuple[int, int, int, int]] = []
+    for x1, y1, x2, y2 in boxes:
+        has_merged = False
+        for idx, (mx1, my1, mx2, my2) in enumerate(merged):
+            overlaps = not (x2 < mx1 or x1 > mx2 or y2 < my1 or y1 > my2)
+            close_y = abs(y1 - my2) <= 20 or abs(y2 - my1) <= 20
+            if overlaps or close_y:
+                merged[idx] = (
+                    min(x1, mx1),
+                    min(y1, my1),
+                    max(x2, mx2),
+                    max(y2, my2),
+                )
+                has_merged = True
+                break
+        if not has_merged:
+            merged.append((x1, y1, x2, y2))
+    return merged
+
+
+def detect_textlike_table_regions(
+    image_bgr: np.ndarray,
+    min_table_height: int = 60,
+    min_table_width: int = 220,
+) -> List[DetectedBox]:
+    bw = preprocess_for_projection(image_bgr)
+    height, width = bw.shape[:2]
+
+    h_proj = (bw > 0).sum(axis=1).astype(np.float32)
+    h_proj_smooth = smooth_signal(h_proj, window=max(7, height // 100))
+    text_threshold = np.percentile(h_proj_smooth, 35)
+    text_regions = h_proj_smooth > text_threshold
+
+    row_spans: List[Tuple[int, int]] = []
+    start = None
+    for y, has_text in enumerate(text_regions):
+        if has_text and start is None:
+            start = y
+        elif not has_text and start is not None:
+            if y - start >= min_table_height:
+                row_spans.append((start, y))
+            start = None
+    if start is not None and height - start >= min_table_height:
+        row_spans.append((start, height))
+
+    candidate_boxes: List[Tuple[int, int, int, int]] = []
+    for y1, y2 in row_spans:
+        row_crop = bw[y1:y2, :]
+        v_proj = (row_crop > 0).sum(axis=0).astype(np.float32)
+        v_proj_smooth = smooth_signal(v_proj, window=max(5, width // 120))
+        empty_threshold = np.percentile(v_proj_smooth, 22)
+        empty_regions = v_proj_smooth <= empty_threshold
+
+        gaps: List[Tuple[int, int]] = []
+        gap_start = None
+        for x, is_empty in enumerate(empty_regions):
+            if is_empty and gap_start is None:
+                gap_start = x
+            elif not is_empty and gap_start is not None:
+                if x - gap_start >= 10:
+                    gaps.append((gap_start, x))
+                gap_start = None
+        if gap_start is not None and width - gap_start >= 10:
+            gaps.append((gap_start, width))
+
+        if len(gaps) >= 2:
+            candidate_boxes.append((gaps[0][0], y1, gaps[-1][1], y2))
+
+    merged_boxes = merge_textlike_boxes(candidate_boxes)
+    return [
+        DetectedBox(
+            x=x1,
+            y=y1,
+            w=x2 - x1,
+            h=y2 - y1,
+            score=0.7,
+            label="table_projection",
+        )
+        for x1, y1, x2, y2 in merged_boxes
+        if (x2 - x1) >= min_table_width and (y2 - y1) >= min_table_height
+    ]
+
+
+def detect_table_regions_hybrid(
+    image_bgr: np.ndarray,
+) -> Tuple[List[DetectedBox], Optional[str]]:
+    log_processing("Hybrid detector: trying Table Transformer first")
+    transformer_boxes, error = detect_table_regions_transformer_improved(
+        image_bgr,
+        score_threshold=0.4,
+    )
+
+    if not transformer_boxes:
+        log_processing("Hybrid detector: transformer returned no boxes, switching to projection detector")
+        projection_boxes = detect_textlike_table_regions(image_bgr)
+        if projection_boxes:
+            log_processing(f"Hybrid detector: projection detector found {len(projection_boxes)} region(s)")
+            return projection_boxes, None
+    elif len(transformer_boxes) == 1 and transformer_boxes[0].score < 0.6:
+        log_processing("Hybrid detector: low-confidence transformer result, adding projection detector")
+        projection_boxes = detect_textlike_table_regions(image_bgr)
+        if projection_boxes:
+            log_processing(
+                f"Hybrid detector: merged transformer + projection boxes, total before NMS={len(transformer_boxes) + len(projection_boxes)}"
+            )
+            return non_max_suppression(
+                transformer_boxes + projection_boxes,
+                iou_threshold=0.3,
+            ), None
+
+    log_processing(f"Hybrid detector: using transformer result, boxes={len(transformer_boxes)}")
+    return transformer_boxes, error
+
+
+def draw_boxes(image_bgr: np.ndarray, boxes: List[DetectedBox]) -> np.ndarray:
+    debug = image_bgr.copy()
+    for box in boxes:
+        cv2.rectangle(
+            debug,
+            (box.x, box.y),
+            (box.x + box.w, box.y + box.h),
+            (0, 180, 0),
+            2,
+        )
+        text = f"{box.label} {box.score:.2f}" if box.score else box.label
+        cv2.putText(
+            debug,
+            text,
+            (box.x, max(15, box.y - 4)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (0, 180, 0),
+            1,
+            cv2.LINE_AA,
+        )
+    return debug
+
+
+def expand_box(box: DetectedBox, img_shape, pad_x: int = 12, pad_y: int = 12) -> DetectedBox:
+    h, w = img_shape[:2]
+    x1 = max(0, box.x - pad_x)
+    y1 = max(0, box.y - pad_y)
+    x2 = min(w, box.x + box.w + pad_x)
+    y2 = min(h, box.y + box.h + pad_y)
+    return DetectedBox(
+        x=x1,
+        y=y1,
+        w=x2 - x1,
+        h=y2 - y1,
+        score=box.score,
+        label=box.label,
+    )
+
+
+def extract_textlike_table_from_image(
+    image_bgr: np.ndarray,
+    source: str,
+) -> Optional[ExtractedTable]:
+    ocr_json = process_images_with_ocr(image_bgr, source_name=source)
+    result = build_table_from_ocr_json(ocr_json)
+    if not result.tables:
+        return None
+
+    dataframe = sanitize_dataframe(result.tables[0].dataframe)
+    if dataframe.empty:
+        return None
+
+    return ExtractedTable(source=source, dataframe=dataframe)
+
+
+def process_textlike_document(uploaded_name: str, raw_bytes: bytes) -> ExtractionResult:
+    if uploaded_name.lower().endswith(".pdf"):
+        pages = pdf_bytes_to_images(raw_bytes, scale=3.2)
+        log_processing(f"Text-like mode: input=PDF, pages={len(pages)}")
+    else:
+        pages = [pil_to_bgr(Image.open(io.BytesIO(raw_bytes)))]
+        log_processing("Text-like mode: input=image, pages=1")
+
+    all_tables: List[ExtractedTable] = []
+    debug_images: List[np.ndarray] = []
+    log_processing("Method=Hybrid detector (Transformer + Projections) + PaddleOCR")
+
+    for page_idx, page in enumerate(pages, start=1):
+        log_processing(f"Text-like mode: processing page {page_idx}")
+        page_processed = preprocess_page_for_detection_adaptive(page, table_type="auto")
+        boxes, detector_error = detect_table_regions_hybrid(page_processed)
+        log_processing(f"Text-like mode: page {page_idx}, detector boxes={len(boxes)}")
+
+        if boxes:
+            debug_images.append(draw_boxes(page_processed, boxes))
+
+        extracted_on_page = False
+        for box_idx, box in enumerate(boxes, start=1):
+            if box.label == "table_projection":
+                pad_x, pad_y = 50, 20
+            else:
+                pad_x, pad_y = 300, 30
+
+            expanded_box = expand_box(box, page_processed.shape, pad_x=pad_x, pad_y=pad_y)
+            crop = page_processed[
+                expanded_box.y: expanded_box.y + expanded_box.h,
+                expanded_box.x: expanded_box.x + expanded_box.w,
+            ]
+            try:
+                log_processing(
+                    f"Text-like mode: page {page_idx}, crop {box_idx}, detector={box.label}, score={box.score:.2f}"
+                )
+                table = extract_textlike_table_from_image(
+                    crop,
+                    source=(
+                        f"Page {page_idx}, table {box_idx} "
+                        f"({box.label}, score={box.score:.2f})"
+                    ),
+                )
+            except Exception as exc:
+                log_processing(
+                    f"Text-like mode: page {page_idx}, crop {box_idx}, OCR extraction failed: {exc}"
+                )
+                table = None
+
+            if table is not None:
+                all_tables.append(table)
+                extracted_on_page = True
+                log_processing(f"Text-like mode: page {page_idx}, crop {box_idx}, table extracted successfully")
+
+        if extracted_on_page:
+            continue
+
+        log_processing(f"Text-like mode: page {page_idx}, falling back to full-page OCR")
+        try:
+            table = extract_textlike_table_from_image(
+                page_processed,
+                source=f"Page {page_idx} (full page OCR fallback)",
+            )
+        except Exception as exc:
+            log_processing(f"Text-like mode: page {page_idx}, full-page OCR fallback failed: {exc}")
+            table = None
+
+        if table is not None:
+            all_tables.append(table)
+            log_processing(f"Text-like mode: page {page_idx}, full-page OCR fallback extracted a table")
+
+        if detector_error:
+            log_processing(f"Text-like mode: detector error on page {page_idx}: {detector_error}")
+
+    return ExtractionResult(
+        method="Hybrid detector (Transformer + Projections) + PaddleOCR",
+        tables=all_tables,
+        debug_images=debug_images,
+    )
 
 def calculate_overlapping(a, b):
     top = max(a["y1"], b["y1"])
@@ -344,15 +823,17 @@ def extract_tables_born_digital(pdf_bytes: bytes) -> List[ExtractedTable]:
 
 
 def process_born_digital_pdf(pdf_bytes: bytes) -> ExtractionResult:
+    log_processing("Born-digital mode: trying pdfplumber first")
     direct_tables = extract_tables_born_digital(pdf_bytes)
     if direct_tables:
+        log_processing(f"Born-digital mode: pdfplumber extracted {len(direct_tables)} table(s)")
         return ExtractionResult(
             method="pdfplumber",
             tables=direct_tables,
             debug_images=[],
         )
 
-    print("pdfplumber found no tables, fallback to detector branch")
+    log_processing("Born-digital mode: pdfplumber found no tables, fallback to detector branch")
     pages = pdf_bytes_to_images(pdf_bytes, scale=3.5)
     return process_images_with_detector(pages, source_name="born_digital_fallback")
 
@@ -361,17 +842,15 @@ def process_born_digital_pdf(pdf_bytes: bytes) -> ExtractionResult:
 def process_scan(uploaded_name: str, raw_bytes: bytes) -> ExtractionResult:
     if uploaded_name.lower().endswith(".pdf"):
         pages = pdf_bytes_to_images(raw_bytes, scale=3.5)
+        log_processing(f"Scan mode: input=PDF, pages={len(pages)}")
     else:
         pages = [pil_to_bgr(Image.open(io.BytesIO(raw_bytes)))]
+        log_processing("Scan mode: input=image, pages=1")
     return process_images_with_detector(pages, source_name="scan")
 
 def process_screenshot(raw_bytes: bytes) -> ExtractionResult:
     image = pil_to_bgr(Image.open(io.BytesIO(raw_bytes)))
     return process_images_with_detector([image], source_name="screenshot")
-
-def process_textlike_tables(raw_bytes: bytes):
-    image = pil_to_bgr(Image.open(io.BytesIO(raw_bytes)))
-    return process_images_with_ocr(image, source_name="textlike")
 
 def build_excel_bytes(tables: List[ExtractedTable]) -> bytes:
     output = io.BytesIO()
@@ -435,7 +914,7 @@ def main():
     with left:
         source_type = st.radio(
             "Тип документа",
-            options=["Чистый структурированный PDF", "Скан", "Text-like или почти без границ (надо загрузить скриншот)"], # добавление типовых сценариев обработки
+            options=["Чистый структурированный PDF", "Скан", "Text-like или почти без границ (PDF или изображение)"], # добавление типовых сценариев обработки
             index=0,
         )
         if source_type == "Чистый структурированный PDF":
@@ -446,7 +925,7 @@ def main():
             allowed_types = ["pdf"]
         else:
             file_type = "text"
-            allowed_types = ["png", "jpeg", "jpg"]
+            allowed_types = ["pdf", "png", "jpeg", "jpg"]
 
         uploaded = st.file_uploader("Загрузите файл", type=allowed_types, key="main_upload") # загрузка файла
         show_file_preview(uploaded, file_type)
@@ -465,7 +944,7 @@ def main():
                     elif file_type == "scan":
                         result = process_scan(uploaded.name, raw) # иначе запускаем OCR
                     else:
-                        result = build_table_from_ocr_json(process_textlike_tables(raw))
+                        result = process_textlike_document(uploaded.name, raw)
                     st.session_state["main_result"] = result
                     st.session_state["main_error"] = ""
             except Exception as exc:
