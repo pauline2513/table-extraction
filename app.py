@@ -1,18 +1,14 @@
 import io
 import os
-import sys
 
-# ========== Critical environment variables ==========
 os.environ["FLAGS_use_mkldnn"] = "0"
 os.environ["FLAGS_use_onednn"] = "0"
-os.environ["FLAGS_enable_pir_api"] = "0"  # This fixes the ArrayAttribute error
+os.environ["FLAGS_enable_pir_api"] = "0"
 os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
 os.environ["PADDLE_USE_GPU"] = "0"
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
-# ===================================================
 
 import json
-# Now import the rest of your libraries
 import streamlit as st
 import torch
 from transformers import AutoImageProcessor, TableTransformerForObjectDetection
@@ -25,33 +21,57 @@ from PIL import Image
 from typing import List, Optional, Tuple
 from dataclasses import dataclass
 
-from custom_dataclasses import ExtractedTable, ExtractionResult
+from custom_dataclasses import ExtractedTable, ExtractionResult, DetectedBox
 from preprocessing import preprocess_crop_for_paddle, preprocess_page_for_detection, bgr_to_pil, pil_to_bgr, pdf_bytes_to_images
 from triplet_extractor import extract_triplets_by_llm
 from preprocessing import preprocess_crop_for_paddle, preprocess_page_for_detection, bgr_to_pil, pil_to_bgr, \
     pdf_bytes_to_images
-# Import paddle and set device
 import paddle
 
-# Force CPU mode
 paddle.set_device('cpu')
 
 TABLE_MODEL_ID = "microsoft/table-transformer-detection"
 TABLE_SCORE_THRESHOLD = 0.7
 
 
-@dataclass
-class DetectedBox:
-    x: int
-    y: int
-    w: int
-    h: int
-    score: float
-    label: str
-
-
 def log_processing(message: str) -> None:
     print(f"[processing] {message}")
+
+def log_exception(message: str) -> None:
+    print(f"[ERROR] {message}")
+
+
+
+@st.cache_resource(show_spinner=False)
+def patch_paddlex_chart_recognition() -> None:
+    """Отключает инициализацию PP-Chart2Table (DocVLM)"""
+    try:
+        from paddlex.inference.pipelines import base as paddlex_base
+    except Exception as exc:
+        log_processing(f"Could not import PaddleX base pipeline for patching: {exc}")
+        return
+
+    if getattr(paddlex_base, "_chart_stubbed", False):
+        return
+
+    original_create_model = paddlex_base.BasePipeline.create_model
+
+    def _create_model_patched(self, config, **kwargs):
+        try:
+            if isinstance(config, dict) and config.get("model_name") == "PP-Chart2Table":
+                log_processing("Отключение инициализации PP-Chart2Table (DocVLM)")
+
+                class _ChartStub:
+                    def __call__(self, *args, **kwargs):
+                        raise RuntimeError("ChartRecognition отключено")
+
+                return _ChartStub()
+        except Exception:
+            pass
+        return original_create_model(self, config, **kwargs)
+
+    paddlex_base.BasePipeline.create_model = _create_model_patched
+    paddlex_base._chart_stubbed = True
 
 
 # убираем NaN и лишние пробелы
@@ -80,27 +100,47 @@ def rows_to_dataframe(rows: List[List[str]]) -> Optional[pd.DataFrame]:
 @st.cache_resource(show_spinner=False)
 def load_paddle_table_engine():
     from paddleocr import PPStructureV3
+    patch_paddlex_chart_recognition()
+    def build_ppstructurev3_config():
+        try:
+            from paddlex.inference import load_pipeline_config
+        except Exception as exc:
+            log_processing(f"Failed to load PaddleX config: {exc}")
+            return None
+
+        cfg = load_pipeline_config("PP-StructureV3")
+        try:
+            cfg["use_doc_preprocessor"] = False
+            cfg["use_doc_orientation_classify"] = False
+            cfg["use_doc_unwarping"] = False
+            cfg["use_chart_recognition"] = False
+        except Exception:
+            pass
+
     os.environ.setdefault("FLAGS_enable_pir_api", "0")
     os.environ.setdefault("FLAGS_use_mkldnn", "0")
     os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+    cfg = build_ppstructurev3_config()
     try:
-        return PPStructureV3(
+        engine = PPStructureV3(
             lang="ru",
+            paddlex_config=cfg,
             device="cpu",
             enable_mkldnn=False,
             enable_hpi=False,
-            cpu_threads=4,
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
             use_formula_recognition=False,
             use_chart_recognition=False,
             use_seal_recognition=False,
+            use_region_detection=False,
+            use_table_recognition=True,
         )
-        print("Loaded Paddle PPStructureV3 table engine")
-        return predictor
+        log_processing("Loaded Paddle PPStructureV3 table engine")
+        return engine
     except Exception as exc_v3:
-        raise
+        raise exc_v3
 
 
 @st.cache_resource(show_spinner=False)
@@ -112,7 +152,6 @@ def load_paddle_text_ocr():
         device="cpu",
         enable_mkldnn=False,
         enable_hpi=False,
-        cpu_threads=4,
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
         use_textline_orientation=False,
@@ -121,21 +160,6 @@ def load_paddle_text_ocr():
 
 @st.cache_resource(show_spinner=False)
 def load_table_transformer():
-    try:
-        import torch
-        from transformers.models.auto.image_processing_auto import AutoImageProcessor
-        from transformers.models.auto.modeling_auto import (
-            AutoModelForObjectDetection as TableTransformerForObjectDetection,
-        )
-    except ImportError as exc:
-        return {
-            "processor": None,
-            "model": None,
-            "device": None,
-            "torch": None,
-            "error": str(exc),
-        }
-
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
     try:
@@ -211,14 +235,22 @@ def html_to_dataframes(table_html: str) -> List[pd.DataFrame]:
 
 # --------------------------------- НЕПОСРЕДСТВЕННО РАСПОЗНАВАНИЕ ТАБЛИЦ ---------------------------------
 def extract_tables_with_paddle(crop_bgr: np.ndarray) -> List[pd.DataFrame]:
+    if crop_bgr is None or not isinstance(crop_bgr, np.ndarray) or crop_bgr.size == 0:
+        log_processing("Paddle OCR: empty crop, skipping table extraction")
+        return []
     engine = load_paddle_table_engine()
     html_list: List[str] = []
     predictions = engine.predict(
         crop_bgr,
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
         use_formula_recognition=False,
         use_chart_recognition=False,
         use_seal_recognition=False,
+        use_region_detection=False,
         use_table_recognition=True,
+        use_table_orientation_classify=False,
     )
     for pred in predictions:
         html_list.extend(collect_table_html_v3(pred))
@@ -634,9 +666,9 @@ def process_textlike_document(uploaded_name: str, raw_bytes: bytes) -> Extractio
         extracted_on_page = False
         for box_idx, box in enumerate(boxes, start=1):
             if box.label == "table_projection":
-                pad_x, pad_y = 50, 20
+                pad_x, pad_y = 50, 5
             else:
-                pad_x, pad_y = 300, 30
+                pad_x, pad_y = 300, 5
 
             expanded_box = expand_box(box, page_processed.shape, pad_x=pad_x, pad_y=pad_y)
             crop = page_processed[
@@ -727,28 +759,28 @@ def estimate_x_tolerance(rows):
     return max(12, int(round(x_tol)))
 
 
-def cluster_column_centers(rows, x_tolerance):
-    all_centers = sorted(it["cx"] for row in rows for it in row)
-    if not all_centers:
+def cluster_column_left_edges(rows, x_tolerance):
+    all_lefts = sorted(it["x1"] for row in rows for it in row)
+    if not all_lefts:
         return []
 
-    clusters = [{"values": [all_centers[0]], "center": all_centers[0]}]
+    clusters = [{"values": [all_lefts[0]], "anchor": all_lefts[0]}]
 
-    for cx in all_centers[1:]:
+    for x1 in all_lefts[1:]:
         last = clusters[-1]
-        if abs(cx - last["center"]) <= x_tolerance:
-            last["values"].append(cx)
-            last["center"] = float(np.mean(last["values"]))
+        if abs(x1 - last["anchor"]) <= x_tolerance:
+            last["values"].append(x1)
+            last["anchor"] = float(np.mean(last["values"]))
         else:
-            clusters.append({"values": [cx], "center": cx})
+            clusters.append({"values": [x1], "anchor": x1})
 
-    return [cl["center"] for cl in clusters]
+    return [cl["anchor"] for cl in clusters]
 
 
 def build_table_from_ocr_json(ocr_result, y_threshold=None, x_tolerance=None) -> ExtractionResult:
     if not ocr_result:
         raise ValueError("OCR result is empty")
-    
+
     page = ocr_result[0].get("res", ocr_result[0])
 
     rec_texts = page.get("rec_texts", [])
@@ -803,22 +835,22 @@ def build_table_from_ocr_json(ocr_result, y_threshold=None, x_tolerance=None) ->
 
     rows = [sorted(row, key=lambda x: x["x1"]) for row in rows]
 
-    # ---------- построение колонок ----------
+    # ---------- построение колонок по левым краям ----------
     if x_tolerance is None:
         x_tolerance = estimate_x_tolerance(rows)
 
-    col_centers = cluster_column_centers(rows, x_tolerance)
+    col_lefts = cluster_column_left_edges(rows, x_tolerance)
 
-    if not col_centers:
-        raise ValueError("Failed to estimate column centers")
+    if not col_lefts:
+        raise ValueError("Failed to estimate column anchors")
 
     # ---------- выравнивание строк по колонкам ----------
     table = []
     for row in rows:
-        aligned = [None] * len(col_centers)
+        aligned = [None] * len(col_lefts)
 
         for cell in row:
-            distances = [abs(cell["cx"] - cc) for cc in col_centers]
+            distances = [abs(cell["x1"] - cl) for cl in col_lefts]
             best_idx = int(np.argmin(distances))
             best_dist = distances[best_idx]
 
@@ -834,7 +866,7 @@ def build_table_from_ocr_json(ocr_result, y_threshold=None, x_tolerance=None) ->
 
     # ---------- удаление полностью пустых колонок ----------
     non_empty_cols = [
-        j for j in range(len(col_centers))
+        j for j in range(len(col_lefts))
         if any(row[j] is not None and str(row[j]).strip() for row in table)
     ]
 
@@ -1044,7 +1076,7 @@ def main():
             allowed_types = ["pdf"]
         else:
             file_type = "text"
-            allowed_types = ["png", "jpeg", "jpg"]
+            allowed_types = ["pdf", "png", "jpeg", "jpg"]
 
         uploaded = st.file_uploader("Загрузите файл", type=allowed_types, key="main_upload")  # загрузка файла
         show_file_preview(uploaded, file_type)
@@ -1063,12 +1095,16 @@ def main():
                     elif file_type == "scan":
                         result = process_scan(uploaded.name, raw) # иначе запускаем OCR
                     else:
-                        result = build_table_from_ocr_json(process_textlike_tables(raw))
+                        if uploaded.name.lower().endswith(".pdf"):
+                            result = process_textlike_document(uploaded.name, raw)
+                        else:
+                            result = build_table_from_ocr_json(process_textlike_tables(raw))
                     st.session_state["main_result"] = result
                     st.session_state["main_error"] = ""
                     st.session_state["main_triplets"] = None
                     st.session_state["main_triplets_error"] = ""
             except Exception as exc:
+                log_exception("Main processing failed with exception.")
                 st.session_state["main_result"] = None
                 st.session_state["main_error"] = str(exc)
     # отображение результата на правой части экрана
@@ -1101,6 +1137,7 @@ def main():
                     st.session_state["screenshot_triplets"] = None
                     st.session_state["screenshot_triplets_error"] = ""
             except Exception as exc:
+                log_exception("Screenshot processing failed with exception.")
                 st.session_state["shot_result"] = None
                 st.session_state["shot_error"] = str(exc)
 
