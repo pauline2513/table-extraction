@@ -295,7 +295,7 @@ def process_images_with_ocr(image_bgr: np.ndarray, source_name: str):
     json_results = []
     for res in result:
         res.print()
-        res.save_to_img("output")
+        # res.save_to_img("output")
         json_results.append(res.json) 
     return json_results
 
