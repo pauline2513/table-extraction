@@ -20,86 +20,132 @@ schema = TripletsPayload.model_json_schema()
 
 
 SYSTEM_PROMPT = """
-Ты - модель для извлечения триплетов из CSV таблиц разделенных ';'. 
+Ты — модель для извлечения триплетов из CSV-таблиц, где столбцы разделены ';'.
 
-1. subject — это название строки (левый заголовок, первый столбец).
-2. object — это название колонки (верхний заголовок).
-3. predicate — это значение в ячейке на пересечении этой строки и этой колонки.
+Верни только JSON:
+{
+  "triplets": [
+    {"subject": "...", "predicate": "...", "object": "..."}
+  ]
+}
 
-Пример таблицы:
-0;1;2;3;4
-показатель;катушка;трансформатор;резерв;наименование способа реализации
-сила тока;1;2;3;с использованием промежуточных пунктов
-сопротивление;4;5;6;в стандартной форме
+Извлекай только то, что явно есть в таблице. Ничего не придумывай.
 
-Правильный результат:
+ОСНОВНАЯ СХЕМА
+- subject — сущность или параметр из строки
+- predicate — значение из ячейки
+- object — заголовок колонки, к которой относится значение
 
+НЕ ИЗВЛЕКАЙ
+- пустые ячейки
+- "-", "—", "–", null, NaN, None
+- технические индексы вроде "0", "1", "2"
+- заголовки как данные
+
+ТЕХНИЧЕСКИЕ ЭЛЕМЕНТЫ
+- Игнорируй строки и колонки, состоящие только из технических индексов.
+- Игнорируй служебный первый столбец с маркерами перечисления: "а)", "б)", "в)", "1)", "2)", "a)", "b)", "№".
+- Если верхняя строка состоит из "0;1;2;..." — это не данные.
+- Если заголовок пустой, технический или бессмысленный, object = "".
+
+ВЫБОР ЗАГОЛОВКОВ
+- Сначала определи осмысленные заголовки.
+- Таблица может иметь несколько строк заголовков подряд.
+- Если заголовок многоуровневый, объединяй его сверху вниз:
+  "верхний | нижний".
+- Если верхний уровень повторяется, а нижний различает колонки, используй объединение.
+- Значения вида "3,95×9,2", "10–20", "К-3-50" могут быть заголовками, если стоят в области header.
+
+ТИПЫ ТАБЛИЦ
+
+1. ОБЫЧНАЯ МАТРИЦА
+Если есть строка заголовков и первый осмысленный столбец с названиями строк:
+- subject = значение из первого осмысленного столбца
+- predicate = значение ячейки
+- object = заголовок колонки
+
+Пример:
+показатель;катушка;трансформатор
+сила тока;1;2
+
+Результат:
 {
   "triplets": [
     {"subject": "сила тока", "predicate": "1", "object": "катушка"},
-    {"subject": "сила тока", "predicate": "2", "object": "трансформатор"},
-    {"subject": "сила тока", "predicate": "3", "object": "резерв"},
-    {"subject": "сила тока", "predicate": "с использованием промежуточных пунктов", "object": "наименование способа реализации"},
-    {"subject": "сопротивление", "predicate": "4", "object": "катушка"},
-    {"subject": "сопротивление", "predicate": "5", "object": "трансформатор"},
-    {"subject": "сопротивление", "predicate": "6", "object": "резерв"}
-    {"subject": "сопротивление", "predicate": "в стандартной форме", "object": "наименование способа реализации"}
+    {"subject": "сила тока", "predicate": "2", "object": "трансформатор"}
   ]
 }
-]
-Если в клетке указан прочерк, то связи нет. Такое извлекать не нужно. 
 
-2. Если таблица состоит из одной строки заголовков и одной строки значений,
-то это горизонтальная таблица параметр → значение.
-В этом случае:
-- subject — название колонки
-- predicate — значение под этой колонкой
-- object — пустая строка ""
+2. ПАРАМЕТР → ЗНАЧЕНИЕ
+Если таблица по смыслу является списком параметров и значений, а не матрицей:
+- horizontal: одна строка заголовков + одна строка значений
+  subject = название колонки
+  predicate = значение
+  object = ""
+- vertical: первый столбец = параметр, второй = значение
+  subject = первый столбец
+  predicate = второй столбец
+  object = ""
+
+3. ОБЪЕКТ + ХАРАКТЕРИСТИКИ
+Если первая осмысленная колонка содержит сущность, а остальные — её свойства:
+- subject = значение из первой осмысленной колонки
+- predicate = значение соседней ячейки
+- object = заголовок колонки
 
 Пример:
-0;1
-ток;сопротивление
-1;2
+Параметр;Единица измерений;Уровень выбросов
+Медь;мг/нм3;≤ 10,0
 
 Результат:
 {
   "triplets": [
-    {"subject": "ток", "predicate": "1", "object": ""},
-    {"subject": "сопротивление", "predicate": "2", "object": ""}
+    {"subject": "Медь", "predicate": "мг/нм3", "object": "Единица измерений"},
+    {"subject": "Медь", "predicate": "≤ 10,0", "object": "Уровень выбросов"}
   ]
 }
 
-3. Если таблица состоит из двух колонок, где в первом столбце указаны названия параметров,
-а во втором столбце — их значения, то это вертикальная таблица параметр → значение.
-В этом случае:
-- subject — значение из первого столбца
-- predicate — значение из второго столбца
-- object — пустая строка ""
+4. СРАВНИТЕЛЬНАЯ ТАБЛИЦА
+Если первая строка содержит название класса объектов в первом столбце и названия объектов в остальных столбцах,
+а ниже в первом столбце идут параметры, то:
+- первая строка — это header, не данные
+- subject = параметр из первого столбца
+- predicate = значение в ячейке
+- object = название объекта из первой строки
 
 Пример:
-0;1
-показатель;
-ток;1,2
-сопротивление;2,0
+Агломашина;К-3-50;К-3-75
+Высота слоя шихты, мм;200-;250
+None;250;260
+Вертикальная скорость спекания, мм/мин;28-35;33-35
+
+Правильная интерпретация:
+- "Агломашина" — это заголовок первого столбца, не subject
+- "К-3-50" и "К-3-75" — это object
+- строка с пустым первым столбцом может продолжать предыдущую строку
+
+Если строка с пустым первым столбцом продолжает предыдущее значение, объединяй их:
+- "200-" + "250" → "200-250"
+- аналогично для других колонок той же строки
 
 Результат:
 {
   "triplets": [
-    {"subject": "ток", "predicate": "1,2", "object": ""},
-    {"subject": "сопротивление", "predicate": "2,0", "object": ""}
+    {"subject": "Высота слоя шихты, мм", "predicate": "200-250", "object": "К-3-50"},
+    {"subject": "Высота слоя шихты, мм", "predicate": "250-260", "object": "К-3-75"},
+    {"subject": "Вертикальная скорость спекания, мм/мин", "predicate": "28-35", "object": "К-3-50"},
+    {"subject": "Вертикальная скорость спекания, мм/мин", "predicate": "33-35", "object": "К-3-75"}
   ]
 }
 
-4. Если верхний заголовок отсутствует, пустой, технический или не несёт смысла,
-оставь object равным пустой строке "".
+ПРАВИЛА ВЫБОРА
+- Не делай object равным subject, если в таблице есть отдельные заголовки колонок.
+- Не извлекай строки header как triplets.
+- Не используй служебные метки и технические индексы как subject или object.
+- Если ячейка длинная текстовая, возвращай её целиком.
+- Если заголовок отсутствует или неосмыслен, object = "".
 
-5. Если в ячейке пусто, указан прочерк "-", "—", "–", null, NaN или значение отсутствует,
-такую связь извлекать не нужно.
-
-6. Не придумывай новые значения.
-Извлекай только то, что явно есть в таблице.
-
-7. Если таблица похожа на список параметров и значений, не пытайся интерпретировать её как матрицу.
+Верни только JSON без пояснений и без markdown.
 """
 
 model = Llama.from_pretrained(
@@ -109,36 +155,39 @@ model = Llama.from_pretrained(
     n_ctx=4096
 )
 
+def has_only_technical_headers(df) -> bool:
+    cols = [str(c).strip() for c in df.columns]
+    return cols == [str(i) for i in range(len(cols))]
+
 def table_to_csv_text(table: ExtractedTable, sep: str = ";") -> str:
     df = table.dataframe.copy()
     df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
+
     df = df.map(
         lambda x: x.replace("\r\n", " ").replace("\n", " ").replace("\r", " ").strip()
         if isinstance(x, str) else x
     )
-    csv_text = df.to_csv(index=False, sep=sep)
+
+    write_header = not has_only_technical_headers(df)
+
+    csv_text = df.to_csv(index=False, header=write_header, sep=sep)
     return csv_text
 
-def extraction_result_tables_to_csv(extraction_result: ExtractionResult, sep: str = ";"):
-    csv_list_tables = []
-    for table in extraction_result.tables:
-        # table = extraction_result.tables[table_idx]
-        csv_list_tables.append(table_to_csv_text(table, sep=sep))
-    return csv_list_tables
+def create_user_prompt_for_table(table, table_idx=None):
+    csv_table = table_to_csv_text(table, sep=";")
+    if table_idx is not None:
+        return f"Таблица {table_idx + 1}.\n{csv_table}"
+    return csv_table
 
-def create_user_prompt(extraction_result):
-    csv_list_tables = extraction_result_tables_to_csv(extraction_result)
-    user_prompt = ""
-    for i, csv_table in enumerate(csv_list_tables):
-        user_prompt += f"Таблица {i+1}. {csv_table} \n"
-    return user_prompt
 
-def extract_triplets_by_llm(extraction_result):
-    user_prompt = create_user_prompt(extraction_result)
+def extract_triplets_for_one_table(table, table_idx=None):
+    user_prompt = create_user_prompt_for_table(table, table_idx)
+
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt}
     ]
+
     start = time.time()
     response = model.create_chat_completion(
         messages,
@@ -152,12 +201,27 @@ def extract_triplets_by_llm(extraction_result):
         max_tokens=4096
     )
     end = time.time()
-    print(f"ВРЕМЯ ВЫПОЛНЕНИЯ ЗАПРОСА {end-start}")
-    print(f"ПОЛЬЗОВАТЕЛЬСКИЙ ЗАПРОС {user_prompt}")
+
+    print(f"ВРЕМЯ ВЫПОЛНЕНИЯ ЗАПРОСА: {end - start:.2f} сек")
+    print(f"ПОЛЬЗОВАТЕЛЬСКИЙ ЗАПРОС:\n{user_prompt}")
+
     outputs = response["choices"][0]["message"]["content"]
+
     try:
         return json.loads(outputs)
-    except:
+    except Exception:
         return outputs
 
+
+def extract_triplets_by_llm(extraction_result):
+    all_results = []
+
+    for i, table in enumerate(extraction_result.tables):
+        result = extract_triplets_for_one_table(table, i)
+        all_results.append({
+            "table_index": i,
+            "result": result
+        })
+
+    return all_results
     
