@@ -214,14 +214,18 @@ def extract_triplets_for_one_table(table, table_idx=None):
 
 
 def extract_triplets_by_llm(extraction_result):
-    all_results = []
+    all_triplets = []
 
     for i, table in enumerate(extraction_result.tables):
         result = extract_triplets_for_one_table(table, i)
-        all_results.append({
-            "table_index": i,
-            "result": result
-        })
 
-    return all_results
-    
+        if isinstance(result, dict) and "triplets" in result:
+            for triplet in result["triplets"]:
+                if isinstance(triplet, dict):
+                    all_triplets.append({
+                        "subject": triplet.get("subject", ""),
+                        "predicate": triplet.get("predicate", ""),
+                        "object": triplet.get("object", ""),
+                    })
+
+    return {"triplets": all_triplets}
