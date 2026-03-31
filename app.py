@@ -22,6 +22,7 @@ from typing import List, Optional, Tuple
 from dataclasses import dataclass
 
 from custom_dataclasses import ExtractedTable, ExtractionResult, DetectedBox
+from db import delete_extraction, get_database_path, get_saved_extractions, init_db, save_triplets_payload
 from preprocessing import preprocess_crop_for_paddle, preprocess_page_for_detection, bgr_to_pil, pil_to_bgr, pdf_bytes_to_images
 from triplet_extractor import extract_triplets_by_llm
 from preprocessing import preprocess_crop_for_paddle, preprocess_page_for_detection, bgr_to_pil, pil_to_bgr, \
@@ -993,7 +994,7 @@ def show_file_preview(uploaded_file, file_type: str):
 #     except Exception as exc:
 #         st.error("Не удалось собрать Excel-файл.")
 
-def render_result(result: ExtractionResult, prefix: str):
+def render_result(result: ExtractionResult, prefix: str, source_name: str, source_type: str):
     st.write(f"Метод обработки: `{result.method}`")
     if not result.tables:
         st.warning("Таблицы не найдены.")
@@ -1021,25 +1022,44 @@ def render_result(result: ExtractionResult, prefix: str):
 
     triplets_key = f"{prefix}_triplets"
     triplets_error_key = f"{prefix}_triplets_error"
+    triplets_saved_key = f"{prefix}_triplets_saved"
 
     if st.button("Извлечь триплеты", key=f"extract_triplets_{prefix}"):
         try:
             with st.spinner("Извлекаю триплеты..."):
                 triplets_result = extract_triplets_by_llm(result)
+                extraction_id, saved_triplets_count = save_triplets_payload(
+                    source_name=source_name,
+                    source_type=source_type,
+                    method=result.method,
+                    triplets_payload=triplets_result,
+                )
                 st.session_state[triplets_key] = triplets_result
                 st.session_state[triplets_error_key] = ""
+                st.session_state[triplets_saved_key] = {
+                    "extraction_id": extraction_id,
+                    "saved_triplets_count": saved_triplets_count,
+                }
         except Exception as exc:
             st.session_state[triplets_key] = None
             st.session_state[triplets_error_key] = str(exc)
+            st.session_state[triplets_saved_key] = None
 
     triplets_error = st.session_state.get(triplets_error_key, "")
     triplets_result = st.session_state.get(triplets_key)
+    triplets_saved = st.session_state.get(triplets_saved_key)
 
     if triplets_error:
         st.error(f"Ошибка извлечения триплетов: {triplets_error}")
     elif triplets_result is not None:
         st.write("Результат извлечения:")
         st.json(triplets_result)
+        if triplets_saved:
+            st.success(
+                "Триплеты сохранены в SQLite: "
+                f"id извлечения {triplets_saved['extraction_id']}, "
+                f"строк триплетов {triplets_saved['saved_triplets_count']}."
+            )
 
         json_bytes = json.dumps(
             triplets_result,
@@ -1055,9 +1075,90 @@ def render_result(result: ExtractionResult, prefix: str):
             key=f"download_triplets_{prefix}",
         )
 # просто логика работы и отрисовка страницы
+def render_saved_triplets_panel() -> None:
+    st.markdown("---")
+    st.subheader("Сохраненные триплеты")
+
+    deleted_id = st.session_state.pop("deleted_extraction_id", None)
+    if deleted_id is not None:
+        st.success(f"Извлечение {deleted_id} удалено из базы данных.")
+
+    search_term = st.text_input(
+        "Поиск по subject/object",
+        key="triplets_search_term",
+        placeholder="Например: ток, сопротивление, катушка",
+    )
+    search_field = st.selectbox(
+        "Где искать",
+        options=[
+            ("all", "Subject и Object"),
+            ("subject", "Только Subject"),
+            ("object", "Только Object"),
+        ],
+        format_func=lambda item: item[1],
+        key="triplets_search_field",
+    )[0]
+
+    try:
+        saved_extractions = get_saved_extractions(
+            search_term=search_term,
+            search_field=search_field,
+            limit=100,
+        )
+    except Exception as exc:
+        st.error(f"Не удалось загрузить сохраненные триплеты: {exc}")
+        return
+
+    if not saved_extractions:
+        st.info("Сохраненные извлечения не найдены.")
+        return
+
+    st.caption(f"Найдено извлечений: {len(saved_extractions)}")
+
+    for item in saved_extractions:
+        title = (
+            f"ID {item['extraction_id']} | {item['source_name']} | "
+            f"{item['triplets_count']} триплетов"
+        )
+        with st.expander(title):
+            st.write(f"Источник: `{item['source_name']}`")
+            st.write(f"Тип источника: `{item['source_type']}`")
+            st.write(f"Метод: `{item['method']}`")
+            st.write(f"Создано: `{item['created_at']}`")
+
+            triplets_df = pd.DataFrame(item["triplets"])
+            if triplets_df.empty:
+                st.info("В этом извлечении нет сохраненных триплетов.")
+            else:
+                st.dataframe(triplets_df, width="stretch")
+
+            if st.button(
+                "Удалить из БД",
+                key=f"delete_extraction_{item['extraction_id']}",
+                type="secondary",
+            ):
+                try:
+                    deleted = delete_extraction(item["extraction_id"])
+                except Exception as exc:
+                    st.error(f"Не удалось удалить извлечение: {exc}")
+                else:
+                    if deleted:
+                        st.session_state["deleted_extraction_id"] = item["extraction_id"]
+                        st.rerun()
+                    else:
+                        st.warning("Запись уже была удалена.")
+
+
 def main():
     st.set_page_config(page_title="Table Extraction", layout="wide")
     st.title("Извлечение таблиц из PDF и сканов")
+    try:
+        init_db()
+    except Exception as exc:
+        st.error(f"Не удалось инициализировать базу данных: {exc}")
+        return
+
+    st.caption(f"SQLite: {get_database_path()}")
 
     left, right = st.columns([1, 2], gap="large")
     # загрузка файла на левой части экрана
@@ -1100,9 +1201,12 @@ def main():
                         else:
                             result = build_table_from_ocr_json(process_textlike_tables(raw))
                     st.session_state["main_result"] = result
+                    st.session_state["main_source_name"] = uploaded.name
+                    st.session_state["main_source_type"] = file_type
                     st.session_state["main_error"] = ""
                     st.session_state["main_triplets"] = None
                     st.session_state["main_triplets_error"] = ""
+                    st.session_state["main_triplets_saved"] = None
             except Exception as exc:
                 log_exception("Main processing failed with exception.")
                 st.session_state["main_result"] = None
@@ -1111,10 +1215,17 @@ def main():
     with right:
         error = st.session_state.get("main_error", "")
         result = st.session_state.get("main_result")
+        main_source_name = st.session_state.get("main_source_name", "main_upload")
+        main_source_type = st.session_state.get("main_source_type", file_type)
         if error:
             st.error(f"Ошибка обработки: {error}")
         elif result is not None:
-            render_result(result, prefix="main")
+            render_result(
+                result,
+                prefix="main",
+                source_name=main_source_name,
+                source_type=main_source_type,
+            )
         else:
             st.info("Выберите тип документа и загрузите файл")
 
@@ -1133,9 +1244,12 @@ def main():
                 with st.spinner("Обрабатка..."):
                     shot_result = process_screenshot(screenshot.getvalue())
                     st.session_state["shot_result"] = shot_result
+                    st.session_state["screenshot_source_name"] = screenshot.name
+                    st.session_state["screenshot_source_type"] = "screenshot"
                     st.session_state["shot_error"] = ""
                     st.session_state["screenshot_triplets"] = None
                     st.session_state["screenshot_triplets_error"] = ""
+                    st.session_state["screenshot_triplets_saved"] = None
             except Exception as exc:
                 log_exception("Screenshot processing failed with exception.")
                 st.session_state["shot_result"] = None
@@ -1143,11 +1257,21 @@ def main():
 
         shot_error = st.session_state.get("shot_error", "")
         shot_result = st.session_state.get("shot_result")
+        screenshot_source_name = st.session_state.get("screenshot_source_name", "screenshot_upload")
+        screenshot_source_type = st.session_state.get("screenshot_source_type", "screenshot")
         if shot_error:
             st.error(f"Ошибка обработки: {shot_error}")
         elif shot_result is not None:
             st.markdown("Результат")
-            render_result(shot_result, prefix="screenshot")
+            render_result(
+                shot_result,
+                prefix="screenshot",
+                source_name=screenshot_source_name,
+                source_type=screenshot_source_type,
+            )
+
+
+        render_saved_triplets_panel()
 
 
 if __name__ == "__main__":
